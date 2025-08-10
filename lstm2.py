@@ -1,18 +1,16 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, r2_score
+import logging
 
 RAW_URL = "https://raw.githubusercontent.com/AnishS04/CS4375_Term_Project/main/AAPL.csv"
 
-# --- Load & prep ---
+### LOAD & PREP ###
 df = pd.read_csv(RAW_URL, usecols=["Date", "Close"])
 df["Date"] = pd.to_datetime(df["Date"])
 df = df.set_index("Date").sort_index()
 
-print("Data loaded:", len(df), "rows")
-print(df.head().to_string())
-
-# --- Plot ---
 plt.plot(df.index, df["Close"])
 plt.title("AAPL Close Price")
 plt.xlabel("Date")
@@ -20,37 +18,25 @@ plt.ylabel("Close")
 plt.tight_layout()
 plt.show()
 
-# --- Windowing util (robust, index-position based) ---
+### WINDOWING ###
+# makes sliding windows so we can say: [t-3, t-2, t-1] -> predict [t]
 def df_to_windowed_df(dataframe: pd.DataFrame, first_date_str: str, last_date_str: str, n: int = 3) -> pd.DataFrame:
-    """
-    Builds a supervised learning dataset with n previous 'Close' values predicting the next 'Close'.
-    Walks the DatetimeIndex by position; no empty slices; aligns to trading days.
-    """
-    first_ts = pd.to_datetime(first_date_str)
+    first_ts = pd.to_datetime(first_date_str)                               # bounds as timestamps
     last_ts  = pd.to_datetime(last_date_str)
-
     idx = dataframe.index
 
-    # Start at the first row >= first_ts, but ensure we have n prior rows for the window
     start_pos = max(idx.searchsorted(first_ts, side="left"), n)
-    # Stop at the first row strictly after last_ts
     end_pos   = idx.searchsorted(last_ts, side="right")
 
     dates = []
     X, Y = [], []
-
-    for pos in range(start_pos, min(end_pos, len(idx))):
-        window = dataframe.iloc[pos - n : pos + 1]["Close"].to_numpy()
-        if window.shape[0] != n + 1:
-            continue  # safety guard
+    
+    for pos in range(start_pos, min(end_pos, len(idx))):                    # iterate date index by integer position
+        window = dataframe.iloc[pos - n : pos + 1]["Close"].to_numpy()      # [n history | target]
         x, y = window[:-1], window[-1]
         dates.append(idx[pos])
         X.append(x)
         Y.append(y)
-
-    if not dates:
-        print("No rows produced. Check your date range or reduce n.")
-        return pd.DataFrame(columns=["Target Date"] + [f"Target-{i}" for i in range(n, 0, -1)] + ["Target"])
 
     ret_df = pd.DataFrame({"Target Date": dates})
     X = np.array(X)
@@ -59,42 +45,34 @@ def df_to_windowed_df(dataframe: pd.DataFrame, first_date_str: str, last_date_st
     ret_df["Target"] = Y
     return ret_df
 
-# --- Build windowed dataset ---
+### BUILD WINDOWED DATASET ###
 windowed_df = df_to_windowed_df(
     df,
-    first_date_str="2018-03-25",
-    last_date_str="2019-03-25",
-    n=3
+    first_date_str="2018-03-25",        # start of the slice (inclusive)
+    last_date_str="2019-03-25",         # end of the slice (exclusive)
+    n=3                                 # use three previous closes to predict the next one
 )
 
-print("\nWindowed dataset preview:")
-print(windowed_df.head().to_string(index=False))
-print("\nRows in windowed_df:", len(windowed_df))
 
+### NUMPY ARRAYS (FOR MODEL) ###
 def windowed_df_to_date_X_y(windowed_dataframe):
-  df_as_np = windowed_dataframe.to_numpy()
-
-  dates = df_as_np[:, 0]
-
-  middle_matrix = df_as_np[:, 1:-1]
-  X = middle_matrix.reshape((len(dates), middle_matrix.shape[1], 1))
-
-  Y = df_as_np[:, -1]
-
-  return dates, X.astype(np.float32), Y.astype(np.float32)
+    df_as_np = windowed_dataframe.to_numpy()
+    dates = df_as_np[:, 0]
+    middle_matrix = df_as_np[:, 1:-1]
+    X = middle_matrix.reshape((len(dates), middle_matrix.shape[1], 1))
+    Y = df_as_np[:, -1]
+    return dates, X.astype(np.float32), Y.astype(np.float32)    # float32 faster
 
 dates, X, y = windowed_df_to_date_X_y(windowed_df)
 
-dates.shape, X.shape, y.shape
-
+### SPLIT ###
 q_80 = int(len(dates) * .8)
 q_90 = int(len(dates) * .9)
-
 dates_train, X_train, y_train = dates[:q_80], X[:q_80], y[:q_80]
-
 dates_val, X_val, y_val = dates[q_80:q_90], X[q_80:q_90], y[q_80:q_90]
 dates_test, X_test, y_test = dates[q_90:], X[q_90:], y[q_90:]
 
+# visualize splits 
 plt.figure()
 plt.plot(dates_train, y_train)
 plt.plot(dates_val,   y_val)
@@ -111,11 +89,7 @@ def dtanh(y): return 1.0 - y * y                 # y is tanh(x)
 def relu(x): return np.maximum(0.0, x)
 def drelu(x): return (x > 0).astype(x.dtype)
 
-class NumpyLSTM_Dense:
-    """
-    LSTM (hidden=64) -> Dense(32, ReLU) -> Dense(32, ReLU) -> Dense(1)
-    Input shape per sample: (T=3, I=1)
-    """
+class LSTM:
     def __init__(self, input_dim=1, hidden=64, seed=42, clip=1.0):
         rng = np.random.default_rng(seed)
         self.I = input_dim
@@ -140,9 +114,9 @@ class NumpyLSTM_Dense:
 
     def _forward_sample(self, x):  # x: (T, I)
         T = x.shape[0]; H = self.H; I = self.I
-        h = np.zeros((T, H)); c = np.zeros((T, H))
-        f = np.zeros((T, H)); i = np.zeros((T, H))
-        o = np.zeros((T, H)); g = np.zeros((T, H))
+        h = np.zeros((T, H)); c = np.zeros((T, H))  # hidden and cell states
+        f = np.zeros((T, H)); i = np.zeros((T, H))  # save gate activations for backprop
+        o = np.zeros((T, H)); g = np.zeros((T, H))  # concatenated [h_{t-1}, x_t]
         z = np.zeros((T, H + I))
 
         h_prev = np.zeros(H); c_prev = np.zeros(H)
@@ -162,23 +136,21 @@ class NumpyLSTM_Dense:
 
         h_T = h[T-1]  # final hidden
 
-        # Dense head
-        z1 = self.W1 @ h_T + self.b1           # (32,)
+        # MLP head adds a bit of nonlinearity capacity after the LSTM
+        z1 = self.W1 @ h_T + self.b1        
         a1 = relu(z1)
-        z2 = self.W2 @ a1 + self.b2            # (32,)
+        z2 = self.W2 @ a1 + self.b2       
         a2 = relu(z2)
-        y_hat = (self.W3 @ a2 + self.b3).reshape(())  # scalar
+        y_hat = (self.W3 @ a2 + self.b3).reshape(())            # scalar
 
-        cache = (x, z, f, i, o, g, c, h, h_T, z1, a1, z2, a2)
+        cache = (x, z, f, i, o, g, c, h, h_T, z1, a1, z2, a2)   # save for backward pass
         return y_hat, cache
 
-    def _backward_sample(self, cache, dy):
-        # dy = dL/dy_hat (scalar)
-        x, z, f, i, o, g, c, h, h_T, z1, a1, z2, a2 = cache
+    def _backward_sample(self, cache, dy):        
+        x, z, f, i, o, g, c, h, h_T, z1, a1, z2, a2 = cache             # dy is dL/dy_hat — derivative of loss w.r.t. prediction for this sample
         T, H = h.shape; I = self.I
-
-        # grads init
-        dWf = np.zeros_like(self.Wf); dWi = np.zeros_like(self.Wi)
+        
+        dWf = np.zeros_like(self.Wf); dWi = np.zeros_like(self.Wi)      # grads init (same shapes as params)
         dWo = np.zeros_like(self.Wo); dWc = np.zeros_like(self.Wc)
         dbf = np.zeros_like(self.bf); dbi = np.zeros_like(self.bi)
         dbo = np.zeros_like(self.bo); dbc = np.zeros_like(self.bc)
@@ -187,21 +159,21 @@ class NumpyLSTM_Dense:
         dW2 = np.zeros_like(self.W2); db2 = np.zeros_like(self.b2)
         dW3 = np.zeros_like(self.W3); db3 = np.zeros_like(self.b3)
 
-        # Dense head backward
-        g3 = float(dy)                                   # ensure scalar float
-        dW3 += g3 * a2[None, :]                          # (1,32)
-        db3 += np.array([g3])                            # (1,)
-        da2 = (self.W3.reshape(-1) * g3)                 # (32,)
-        dz2 = da2 * drelu(z2)                            # (32,)
+        # backprop through the dense head 
+        g3 = float(dy)                                   
+        dW3 += g3 * a2[None, :]                          
+        db3 += np.array([g3])                            
+        da2 = (self.W3.reshape(-1) * g3)                 
+        dz2 = da2 * drelu(z2)                            
 
-        dW2 += dz2[:, None] @ a1[None, :]                # (32,32)
-        db2 += dz2                                       # (32,)
-        da1 = self.W2.T @ dz2                            # (32,)
+        dW2 += dz2[:, None] @ a1[None, :]                
+        db2 += dz2                                       
+        da1 = self.W2.T @ dz2                            
 
-        dz1 = da1 * drelu(z1)                            # (32,)
-        dW1 += dz1[:, None] @ h_T[None, :]               # (32,H)
-        db1 += dz1                                       # (32,)
-        dh_T = self.W1.T @ dz1                           # (H,)
+        dz1 = da1 * drelu(z1)                            
+        dW1 += dz1[:, None] @ h_T[None, :]               
+        db1 += dz1                                       
+        dh_T = self.W1.T @ dz1                           
 
         # LSTM backward (through time)
         dh_next = dh_T
@@ -217,30 +189,29 @@ class NumpyLSTM_Dense:
             dg = dc * i[t]
             dc_prev = dc * f[t]
 
-            df_raw = df * dsigmoid(f[t])
+            df_raw = df * dsigmoid(f[t])                    # gate local gradients
             di_raw = di * dsigmoid(i[t])
             do_raw = do * dsigmoid(o[t])
             dg_raw = dg * dtanh(g[t])
 
             z_t = z[t]
 
-            dWf += np.outer(df_raw, z_t); dbf += df_raw
+            dWf += np.outer(df_raw, z_t); dbf += df_raw     # accumulate param grads
             dWi += np.outer(di_raw, z_t); dbi += di_raw
             dWo += np.outer(do_raw, z_t); dbo += do_raw
             dWc += np.outer(dg_raw, z_t); dbc += dg_raw
 
-            dz = (self.Wf.T @ df_raw
+            dz = (self.Wf.T @ df_raw                        # split gradient to h_{t-1} and x_t (we only need h_{t-1} here)
                 + self.Wi.T @ di_raw
                 + self.Wo.T @ do_raw
                 + self.Wc.T @ dg_raw)
 
-            dh_prev = dz[:H]
-            # dx = dz[H:]  # not used
+            dh_prev = dz[:H]                                # dx = dz[H:]  # not used           
 
             dh_next = dh_prev
             dc_next = dc_prev
 
-        # clip
+        # clip all grads to avoid exploding updates
         for G in (dWf, dWi, dWo, dWc, dbf, dbi, dbo, dbc, dW1, db1, dW2, db2, dW3, db3):
             np.clip(G, -self.clip, self.clip, out=G)
 
@@ -249,25 +220,24 @@ class NumpyLSTM_Dense:
 
     def fit(self, X, y, X_val=None, y_val=None, epochs=100, lr=1e-3, verbose=True):
         N, T, I = X.shape
-        assert I == self.I
+        assert I == self.I                      # input dimension must match 
 
         for epoch in range(1, epochs+1):
-            perm = np.random.permutation(N)
+            perm = np.random.permutation(N)     # randomize sample order each epoch
             total = 0.0
-            for idx in perm:
+            for idx in perm:                    
                 x_i = X[idx]; y_i = y[idx]
 
                 y_hat, cache = self._forward_sample(x_i)
                 err = y_hat - y_i
-                total += 0.5 * (err ** 2)
+                total += 0.5 * (err ** 2)       # half MSE loss
 
                 grads = self._backward_sample(cache, dy=err)
 
                 (dWf, dWi, dWo, dWc, dbf, dbi, dbo, dbc,
                  dW1, db1, dW2, db2, dW3, db3) = grads
-
-                # SGD update
-                self.Wf -= lr * dWf; self.bf -= lr * dbf
+                
+                self.Wf -= lr * dWf; self.bf -= lr * dbf    # SGD update
                 self.Wi -= lr * dWi; self.bi -= lr * dbi
                 self.Wo -= lr * dWo; self.bo -= lr * dbo
                 self.Wc -= lr * dWc; self.bc -= lr * dbc
@@ -291,27 +261,27 @@ class NumpyLSTM_Dense:
         for n in range(N):
             y_hat, _ = self._forward_sample(X[n])
             out[n] = y_hat
-        return out
+        return out          # vector of predictions aligned with X
 
-# ===== Train =====
-model = NumpyLSTM_Dense(input_dim=1, hidden=64, clip=1.0)
+### TRAINING & EVALUATION ###
+model = LSTM(input_dim=1, hidden=64, clip=1.0)
 model.fit(X_train, y_train, X_val, y_val, epochs=100, lr=1e-3, verbose=True)
 
-# ===== Predictions & plots =====
+### PREDICTIONS & VISUALIZATION ###
 train_predictions = model.predict(X_train)
 val_predictions   = model.predict(X_val)
 test_predictions  = model.predict(X_test)
 
-plt.figure(); plt.plot(dates_train, train_predictions); plt.plot(dates_train, y_train)
+plt.figure(); plt.plot(dates_train, train_predictions); plt.plot(dates_train, y_train)          # training curvve
 plt.legend(['Training Predictions', 'Training Observations']); plt.tight_layout(); plt.show()
 
-plt.figure(); plt.plot(dates_val, val_predictions); plt.plot(dates_val, y_val)
+plt.figure(); plt.plot(dates_val, val_predictions); plt.plot(dates_val, y_val)                  # validation curve  
 plt.legend(['Validation Predictions', 'Validation Observations']); plt.tight_layout(); plt.show()
 
-plt.figure(); plt.plot(dates_test, test_predictions); plt.plot(dates_test, y_test)
+plt.figure(); plt.plot(dates_test, test_predictions); plt.plot(dates_test, y_test)              # testing curve
 plt.legend(['Testing Predictions', 'Testing Observations']); plt.tight_layout(); plt.show()
 
-plt.figure()
+plt.figure()                                                                                    # combined plot
 plt.plot(dates_train, train_predictions); plt.plot(dates_train, y_train)
 plt.plot(dates_val,   val_predictions);   plt.plot(dates_val,   y_val)
 plt.plot(dates_test,  test_predictions);  plt.plot(dates_test,  y_test)
@@ -320,49 +290,31 @@ plt.legend(['Training Predictions','Training Observations',
             'Testing Predictions','Testing Observations'])
 plt.tight_layout(); plt.show()
 
+### LOGGING ###
+logging.basicConfig(filename='experiment_log.csv', level=logging.INFO, format='%(message)s')
+logging.info("---------------\nParameters Chosen / Results")
 
-from sklearn.metrics import mean_squared_error, r2_score
-import logging
-
-# --- Initialize logging ---
-logging.basicConfig(filename='experiment_log.csv', level=logging.INFO)
-
-# --- Log Header (one-time write) ---
-logging.info("Experiment Log\n---------------\nExperiment Number, Parameters Chosen, Results")
-
-# --- Training & Evaluation --- (for each experiment)
-def log_experiment(experiment_number, epochs, lr, batch_size, X_train, y_train, X_test, y_test, train_predictions, test_predictions):
-    # Calculate RMSE for training and test sets
-    train_mse = mean_squared_error(y_train, train_predictions)
+def log_experiment(epochs, lr, X_train, y_train, X_test, y_test, train_predictions, test_predictions):      
+    train_mse = mean_squared_error(y_train, train_predictions) 
     test_mse = mean_squared_error(y_test, test_predictions)
 
-    train_rmse = np.sqrt(train_mse)  # Manual calculation of RMSE
-    test_rmse = np.sqrt(test_mse)    # Manual calculation of RMSE
+    train_rmse = np.sqrt(train_mse)  
+    test_rmse = np.sqrt(test_mse)    
     
     train_r2 = r2_score(y_train, train_predictions)
     test_r2 = r2_score(y_test, test_predictions)
-
-    # Dataset sizes (can be adjusted to match your actual data)
-    train_size = len(X_train)
-    test_size = len(X_test)
     
-    # Train/Test split ratio
-    train_test_split = f"{train_size}/{test_size}"
-
-    # Log experiment details
-    logging.info(f"{experiment_number}, epochs={epochs}, lr={lr}, batch_size={batch_size}, "
+    train_size = len(X_train)
+    test_size = len(X_test)    
+    
+    train_test_split = f"{train_size}/{test_size}"      # Train/Test split ratio
+    
+    logging.info(f"epochs={epochs}, lr={lr}, "
                  f"train/test split={train_test_split}, dataset size={train_size + test_size}, "
                  f"training RMSE={train_rmse:.2f}, test RMSE={test_rmse:.2f}, "
-                 f"training R²={train_r2:.2f}, test R²={test_r2:.2f}")
+                 f"training R2={train_r2:.2f}, test R2={test_r2:.2f}")
 
-# Example for logging after an experiment:
-experiment_number = 1
 epochs = 100
 lr = 1e-3
-batch_size = 64
 
-# Assuming model training and prediction has already been performed:
-train_predictions = model.predict(X_train)
-test_predictions = model.predict(X_test)
-
-log_experiment(experiment_number, epochs, lr, batch_size, X_train, y_train, X_test, y_test, train_predictions, test_predictions)
+log_experiment(epochs, lr, X_train, y_train, X_test, y_test, train_predictions, test_predictions)
